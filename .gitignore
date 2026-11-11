@@ -1,1 +1,19 @@
+# Nest picker build output (./build.sh)
 out/
+
+# Python (hatch-bridge, uv)
+.venv/
+__pycache__/
+*.py[cod]
+
+# PlatformIO (hatch-ble-bridge)
+.pio/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Screen previews from `nest-picker --render-test`
+*.ppm

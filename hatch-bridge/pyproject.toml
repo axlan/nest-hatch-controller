@@ -1,15 +1,19 @@
 [project]
 name = "hatch-bridge"
 version = "0.1.0"
-description = "MQTT -> Hatch Rest (gen 1) BLE color bridge for the Nest color picker"
+description = "Nest picker -> Hatch Rest (gen 1) tools: Python BLE bridge and ESP32 bridge setup"
 requires-python = ">=3.11"
 dependencies = [
     "bleak>=0.22",
     "aiomqtt>=2.3",
+    "paho-mqtt>=2.0",
+    "typer>=0.12",
+    "zeroconf>=0.132",
 ]
 
 [project.scripts]
 hatch-bridge = "hatch_bridge:main"
+hatch-ble-bridge-setup = "hatch_bridge.device_setup:app"
 
 [build-system]
 requires = ["hatchling"]

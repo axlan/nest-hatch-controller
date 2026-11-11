@@ -1,16 +1,18 @@
 /*
  * nest-picker: turn a Nest Learning Thermostat (Gen 1, "Diamond") into an
- * MQTT color picker.
+ * MQTT color + sound picker (for a Hatch Rest, via hatch-bridge).
  *
  *   - Freezes the stock UI (nlclient) and its software watchdog (nlheartbeatd)
  *     with SIGSTOP. Killing them makes the system reboot; freezing does not.
  *   - Draws directly to the 320x320 framebuffer (/dev/fb0).
- *   - Ring rotation (/dev/input/event1) adjusts the active channel,
- *     pressing the display (/dev/input/event2) cycles Hue -> Saturation ->
- *     Brightness. A long press re-sends the current color.
- *   - Publishes the color as JSON to an MQTT broker (MQTT 3.1.1, QoS 0).
+ *   - Ring rotation (/dev/input/event1) picks the hue, or the sound on the
+ *     sound page. Pressing the display (/dev/input/event2) toggles between the
+ *     two pages. A long press re-sends the current color and sound.
+ *   - Publishes <topic>/color and <topic>/sound as JSON (MQTT 3.1.1, QoS 0).
  *
  * Built against glibc 2.19 / kernel 2.6.37 (see build/Dockerfile).
+ * `nest-picker --render-test DIR` renders both pages to PPM files without
+ * touching any hardware (works on a normal Linux PC for previewing).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -41,7 +43,44 @@
 
 #include "font5x7.h"
 
-#define VERSION "1.0"
+#define VERSION "2.0"
+
+/* ------------------------------------------------------------------------ */
+/* Sounds (Hatch Rest gen 1 ids; bird chirps (9) intentionally left out)    */
+/* ------------------------------------------------------------------------ */
+
+enum icon {
+    ICON_NONE, ICON_STREAM, ICON_NOISE, ICON_DRYER, ICON_OCEAN, ICON_WIND,
+    ICON_RAIN, ICON_CRICKETS, ICON_LULLABY, ICON_TWINKLE, ICON_ROCKABYE
+};
+
+static const struct sound {
+    int id;
+    const char *name;   /* MQTT name (matches pyhatchbabyrest) */
+    const char *label;  /* on-screen */
+    enum icon icon;
+} sounds[] = {
+    {  0, "none",     "NONE",        ICON_NONE },
+    {  2, "stream",   "STREAM",      ICON_STREAM },
+    {  3, "noise",    "WHITE NOISE", ICON_NOISE },
+    {  4, "dryer",    "DRYER",       ICON_DRYER },
+    {  5, "ocean",    "OCEAN",       ICON_OCEAN },
+    {  6, "wind",     "WIND",        ICON_WIND },
+    {  7, "rain",     "RAIN",        ICON_RAIN },
+    { 10, "crickets", "CRICKETS",    ICON_CRICKETS },
+    { 11, "brahms",   "LULLABY",     ICON_LULLABY },
+    { 13, "twinkle",  "TWINKLE",     ICON_TWINKLE },
+    { 14, "rockabye", "ROCKABYE",    ICON_ROCKABYE },
+};
+#define NSOUNDS ((int)(sizeof(sounds) / sizeof(sounds[0])))
+
+static int sound_index_for_id(int id)
+{
+    int i;
+    for (i = 0; i < NSOUNDS; i++)
+        if (sounds[i].id == id) return i;
+    return 0;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Configuration                                                            */
@@ -61,11 +100,12 @@ static struct {
     int  sleep_secs;       /* backlight off after this much idle; 0 = never */
     int  backlight;        /* 0..100 */
     float hue_step;        /* degrees per ring count */
-    float pct_step;        /* percent per ring count (sat / brightness) */
+    int  sound_step;       /* ring counts per sound */
     int  ring_invert;
     int  beep;
     int  takeover;         /* freeze nlclient/nlheartbeatd */
-    int  start_h, start_s, start_v;
+    int  start_h;
+    int  start_sound;      /* Hatch sound id */
     char state_file[128];
 } cfg;
 
@@ -79,13 +119,12 @@ static void cfg_defaults(void)
     cfg.sleep_secs = 300;
     cfg.backlight = 80;
     cfg.hue_step = 1.0f;
-    cfg.pct_step = 0.5f;
+    cfg.sound_step = 12;
     cfg.ring_invert = 0;
     cfg.beep = 1;
     cfg.takeover = 1;
     cfg.start_h = 30;
-    cfg.start_s = 100;
-    cfg.start_v = 100;
+    cfg.start_sound = 0;
     strcpy(cfg.state_file, "/media/user-config/nest-picker.state");
 }
 
@@ -135,13 +174,12 @@ static void cfg_load(const char *path)
         I("SLEEP_SECS", sleep_secs);
         I("BACKLIGHT", backlight);
         F("HUE_STEP", hue_step);
-        F("PCT_STEP", pct_step);
+        I("SOUND_STEP", sound_step);
         I("RING_INVERT", ring_invert);
         I("BEEP", beep);
         I("TAKEOVER", takeover);
         I("START_H", start_h);
-        I("START_S", start_s);
-        I("START_V", start_v);
+        I("START_SOUND", start_sound);
         S("STATE_FILE", state_file);
 #undef S
 #undef I
@@ -151,7 +189,7 @@ static void cfg_load(const char *path)
     if (cfg.backlight < 1) cfg.backlight = 1;
     if (cfg.backlight > 100) cfg.backlight = 100;
     if (cfg.hue_step <= 0) cfg.hue_step = 1.0f;
-    if (cfg.pct_step <= 0) cfg.pct_step = 0.5f;
+    if (cfg.sound_step < 1) cfg.sound_step = 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -193,7 +231,7 @@ static pid_t find_pid(const char *name)
     pid_t found = 0;
     if (!d) return 0;
     while ((e = readdir(d)) != NULL) {
-        char path[64], buf[64];
+        char path[300], buf[64];
         int fd;
         ssize_t n;
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
@@ -322,6 +360,7 @@ static void fb_present(void)
 {
     int p, y;
     struct omapfb_update_window uw;
+    if (!fb_mem) return; /* --render-test */
     for (p = 0; p < fb_pages; p++) {
         size_t base = (size_t)p * H * fb_stride;
         if (base + H * fb_stride > fb_len) break;
@@ -338,8 +377,6 @@ static void fb_present(void)
     ioctl(fb_fd, OMAPFB_UPDATE_WINDOW, &uw);
 }
 
-static int backlight_level = -1;
-
 static void display_power(int on)
 {
     char buf[16];
@@ -347,11 +384,9 @@ static void display_power(int on)
         write_sysfs(BLANK_PATH, "0\n");
         snprintf(buf, sizeof(buf), "%d\n", cfg.backlight);
         write_sysfs(BACKLIGHT_PATH, buf);
-        backlight_level = cfg.backlight;
     } else {
         write_sysfs(BACKLIGHT_PATH, "0\n");
         write_sysfs(BLANK_PATH, "1\n");
-        backlight_level = 0;
     }
 }
 
@@ -380,7 +415,7 @@ static void hsv_to_rgb(float h, float s, float v, int *r, int *g, int *b)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Drawing primitives                                                       */
+/* Drawing primitives (all anti-aliased; pixel centres are integer coords)  */
 /* ------------------------------------------------------------------------ */
 
 static void put(int x, int y, uint32_t c)
@@ -388,31 +423,87 @@ static void put(int x, int y, uint32_t c)
     if (x >= 0 && x < W && y >= 0 && y < H) frame[y * W + x] = c;
 }
 
-/* Anti-aliased filled disc. */
+static void put_a(int x, int y, uint32_t c, float a)
+{
+    if (a <= 0 || x < 0 || x >= W || y < 0 || y >= H) return;
+    frame[y * W + x] = blend(frame[y * W + x], c, a);
+}
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
 static void fill_circle(float cx, float cy, float r, uint32_t c)
 {
-    int x0 = (int)(cx - r - 2), x1 = (int)(cx + r + 2);
-    int y0 = (int)(cy - r - 2), y1 = (int)(cy + r + 2);
+    int x0 = clampi((int)(cx - r - 2), 0, W - 1), x1 = clampi((int)(cx + r + 2), 0, W - 1);
+    int y0 = clampi((int)(cy - r - 2), 0, H - 1), y1 = clampi((int)(cy + r + 2), 0, H - 1);
     int x, y;
     for (y = y0; y <= y1; y++) {
-        if (y < 0 || y >= H) continue;
         for (x = x0; x <= x1; x++) {
-            float dx, dy, d2, d, a;
-            if (x < 0 || x >= W) continue;
-            dx = x - cx; dy = y - cy;
-            d2 = dx * dx + dy * dy;
+            float dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
             if (d2 <= (r - 1) * (r - 1)) { frame[y * W + x] = c; continue; }
             if (d2 >= (r + 1) * (r + 1)) continue;
-            d = sqrtf(d2);
-            a = r + 0.5f - d;
-            frame[y * W + x] = blend(frame[y * W + x], c, a);
+            put_a(x, y, c, r + 0.5f - sqrtf(d2));
         }
     }
 }
 
-/* Anti-aliased ring (annulus) between r_in and r_out around the screen centre,
- * restricted to the angle range [0, deg_end) measured clockwise from the top. */
-static void fill_arc(float r_in, float r_out, int tenths_end, uint32_t (*color_at)(int tenths, void *), void *ctx)
+static void draw_ring(float cx, float cy, float r, float w, uint32_t c)
+{
+    int x0 = clampi((int)(cx - r - w - 2), 0, W - 1), x1 = clampi((int)(cx + r + w + 2), 0, W - 1);
+    int y0 = clampi((int)(cy - r - w - 2), 0, H - 1), y1 = clampi((int)(cy + r + w + 2), 0, H - 1);
+    int x, y;
+    for (y = y0; y <= y1; y++)
+        for (x = x0; x <= x1; x++) {
+            float dx = x - cx, dy = y - cy;
+            put_a(x, y, c, w / 2 + 0.5f - fabsf(sqrtf(dx * dx + dy * dy) - r));
+        }
+}
+
+/* Thick line with round caps. */
+static void draw_line(float ax, float ay, float bx, float by, float w, uint32_t c)
+{
+    float hw = w / 2;
+    int x0 = clampi((int)(fminf(ax, bx) - hw - 2), 0, W - 1), x1 = clampi((int)(fmaxf(ax, bx) + hw + 2), 0, W - 1);
+    int y0 = clampi((int)(fminf(ay, by) - hw - 2), 0, H - 1), y1 = clampi((int)(fmaxf(ay, by) + hw + 2), 0, H - 1);
+    float vx = bx - ax, vy = by - ay, len2 = vx * vx + vy * vy;
+    int x, y;
+    for (y = y0; y <= y1; y++)
+        for (x = x0; x <= x1; x++) {
+            float px = x - ax, py = y - ay, t = len2 > 0 ? (px * vx + py * vy) / len2 : 0, dx, dy;
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            dx = px - t * vx; dy = py - t * vy;
+            put_a(x, y, c, hw + 0.5f - sqrtf(dx * dx + dy * dy));
+        }
+}
+
+/* Filled polygon, 4x supersampled even-odd fill. */
+static void fill_poly(const float *pts, int n, uint32_t c)
+{
+    float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+    static const float off[4][2] = { {-0.25f, -0.25f}, {0.25f, -0.25f}, {-0.25f, 0.25f}, {0.25f, 0.25f} };
+    int i, x, y, s;
+    for (i = 0; i < n; i++) {
+        minx = fminf(minx, pts[2 * i]); maxx = fmaxf(maxx, pts[2 * i]);
+        miny = fminf(miny, pts[2 * i + 1]); maxy = fmaxf(maxy, pts[2 * i + 1]);
+    }
+    for (y = clampi((int)miny - 1, 0, H - 1); y <= clampi((int)maxy + 1, 0, H - 1); y++)
+        for (x = clampi((int)minx - 1, 0, W - 1); x <= clampi((int)maxx + 1, 0, W - 1); x++) {
+            int hits = 0;
+            for (s = 0; s < 4; s++) {
+                float px = x + off[s][0], py = y + off[s][1];
+                int in = 0, j = n - 1;
+                for (i = 0; i < n; j = i++) {
+                    float xi = pts[2 * i], yi = pts[2 * i + 1], xj = pts[2 * j], yj = pts[2 * j + 1];
+                    if ((yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi) in = !in;
+                }
+                hits += in;
+            }
+            put_a(x, y, c, hits / 4.0f);
+        }
+}
+
+/* Ring (annulus) around the screen centre, colour by angle (tenths of degrees, 0 = top). */
+static void fill_arc(float r_in, float r_out, uint32_t (*color_at)(int tenths))
 {
     int y0 = (int)(CY - r_out - 2), y1 = (int)(CY + r_out + 2);
     int x, y;
@@ -421,11 +512,10 @@ static void fill_arc(float r_in, float r_out, int tenths_end, uint32_t (*color_a
             int i = y * W + x;
             float d = radius_tbl[i], a;
             if (d < r_in - 1 || d > r_out + 1) continue;
-            if (angle_tbl[i] >= tenths_end) continue;
             a = 1.0f;
             if (d > r_out - 0.5f) a = r_out + 0.5f - d;
             else if (d < r_in + 0.5f) a = d - (r_in - 0.5f);
-            frame[i] = blend(frame[i], color_at(angle_tbl[i], ctx), a);
+            frame[i] = blend(frame[i], color_at(angle_tbl[i]), a);
         }
     }
 }
@@ -456,25 +546,167 @@ static void draw_text_centered(int y, const char *s, int scale, uint32_t c)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Sound icons: vector drawings in a unit box (-1..1), y down               */
+/* ------------------------------------------------------------------------ */
+
+static float icx, icy, isz;     /* icon centre and half-size in pixels */
+static uint32_t ifg, ibg;       /* icon ink and the colour behind it */
+
+#define IX(u) (icx + (u) * isz)
+#define IY(v) (icy + (v) * isz)
+static void L(float u0, float v0, float u1, float v1, float w) { draw_line(IX(u0), IY(v0), IX(u1), IY(v1), w * isz, ifg); }
+static void C(float u, float v, float r) { fill_circle(IX(u), IY(v), r * isz, ifg); }
+static void CB(float u, float v, float r) { fill_circle(IX(u), IY(v), r * isz, ibg); }
+static void R(float u, float v, float r, float w) { draw_ring(IX(u), IY(v), r * isz, w * isz, ifg); }
+
+static void WAVE(float v, float amp, float periods, float w, float u0, float u1)
+{
+    int i, n = 18;
+    float pu = u0, pv = v;
+    for (i = 1; i <= n; i++) {
+        float t = (float)i / n, u = u0 + (u1 - u0) * t;
+        float vv = v - amp * sinf(t * periods * 2.0f * (float)M_PI);
+        L(pu, pv, u, vv, w);
+        pu = u; pv = vv;
+    }
+}
+
+/* Arc as a polyline; angles in degrees, 0 = right, 90 = down. */
+static void ARC(float u, float v, float r, float a0, float a1, float w)
+{
+    int i, n = 12;
+    float pu = u + r * cosf(a0 * (float)M_PI / 180), pv = v + r * sinf(a0 * (float)M_PI / 180);
+    for (i = 1; i <= n; i++) {
+        float a = (a0 + (a1 - a0) * i / n) * (float)M_PI / 180;
+        float nu = u + r * cosf(a), nv = v + r * sinf(a);
+        L(pu, pv, nu, nv, w);
+        pu = nu; pv = nv;
+    }
+}
+
+static void draw_icon(enum icon icon, float cx, float cy, float half, uint32_t fg, uint32_t bg)
+{
+    int i;
+    icx = cx; icy = cy; isz = half; ifg = fg; ibg = bg;
+    switch (icon) {
+    case ICON_NONE:
+        R(0, 0, 0.78f, 0.17f);
+        L(-0.55f, 0.55f, 0.55f, -0.55f, 0.17f);
+        break;
+    case ICON_STREAM:
+        WAVE(-0.5f, 0.12f, 1.5f, 0.14f, -0.85f, 0.85f);
+        WAVE(-0.1f, 0.12f, 1.5f, 0.14f, -0.85f, 0.85f);
+        C(-0.5f, 0.56f, 0.26f);
+        C(0.08f, 0.62f, 0.2f);
+        C(0.58f, 0.56f, 0.24f);
+        break;
+    case ICON_NOISE: {
+        static const float h[7] = { 0.35f, 0.75f, 0.5f, 0.92f, 0.6f, 0.82f, 0.4f };
+        for (i = 0; i < 7; i++) {
+            float u = -0.78f + i * 0.26f;
+            L(u, -h[i], u, h[i], 0.14f);
+        }
+        break;
+    }
+    case ICON_DRYER:
+        L(-0.72f, -0.82f, 0.72f, -0.82f, 0.13f);
+        L(0.72f, -0.82f, 0.72f, 0.85f, 0.13f);
+        L(0.72f, 0.85f, -0.72f, 0.85f, 0.13f);
+        L(-0.72f, 0.85f, -0.72f, -0.82f, 0.13f);
+        L(-0.72f, -0.5f, 0.72f, -0.5f, 0.1f);
+        C(-0.45f, -0.66f, 0.07f);
+        C(-0.22f, -0.66f, 0.07f);
+        R(0, 0.2f, 0.4f, 0.13f);
+        ARC(0, 0.2f, 0.2f, 200, 290, 0.09f);
+        break;
+    case ICON_OCEAN:
+        WAVE(-0.5f, 0.16f, 1.5f, 0.15f, -0.85f, 0.85f);
+        WAVE(0.0f, 0.16f, 1.5f, 0.15f, -0.85f, 0.85f);
+        WAVE(0.5f, 0.16f, 1.5f, 0.15f, -0.85f, 0.85f);
+        break;
+    case ICON_WIND:
+        L(-0.85f, -0.3f, 0.3f, -0.3f, 0.13f);
+        ARC(0.3f, -0.52f, 0.22f, 90, -200, 0.13f);
+        L(-0.85f, 0.05f, 0.7f, 0.05f, 0.13f);
+        L(-0.85f, 0.4f, 0.1f, 0.4f, 0.13f);
+        ARC(0.1f, 0.62f, 0.22f, -90, 160, 0.13f);
+        break;
+    case ICON_RAIN:
+        C(-0.4f, -0.22f, 0.28f);
+        C(0.05f, -0.4f, 0.36f);
+        C(0.44f, -0.2f, 0.28f);
+        L(-0.42f, -0.06f, 0.46f, -0.06f, 0.34f);
+        L(-0.38f, 0.38f, -0.48f, 0.64f, 0.13f);
+        L(0.05f, 0.38f, -0.05f, 0.64f, 0.13f);
+        L(0.48f, 0.38f, 0.38f, 0.64f, 0.13f);
+        L(-0.16f, 0.78f, -0.2f, 0.88f, 0.13f);
+        L(0.28f, 0.78f, 0.24f, 0.88f, 0.13f);
+        break;
+    case ICON_CRICKETS: { /* pine tree: three stacked tiers and a trunk */
+        static const float tiers[3][6] = {
+            { 0.0f, -0.95f,  0.36f, -0.42f, -0.36f, -0.42f },
+            { 0.0f, -0.62f,  0.56f,  0.06f, -0.56f,  0.06f },
+            { 0.0f, -0.26f,  0.78f,  0.56f, -0.78f,  0.56f },
+        };
+        float trunk[8] = { IX(-0.14f), IY(0.5f), IX(0.14f), IY(0.5f), IX(0.14f), IY(0.92f), IX(-0.14f), IY(0.92f) };
+        for (i = 0; i < 3; i++) {
+            float p[6];
+            int k;
+            for (k = 0; k < 3; k++) {
+                p[2 * k] = IX(tiers[i][2 * k]);
+                p[2 * k + 1] = IY(tiers[i][2 * k + 1]);
+            }
+            fill_poly(p, 3, ifg);
+        }
+        fill_poly(trunk, 4, ifg);
+        break;
+    }
+    case ICON_LULLABY:
+        C(-0.45f, 0.55f, 0.24f);
+        C(0.42f, 0.42f, 0.24f);
+        L(-0.24f, 0.52f, -0.24f, -0.58f, 0.12f);
+        L(0.63f, 0.39f, 0.63f, -0.72f, 0.12f);
+        L(-0.24f, -0.62f, 0.63f, -0.76f, 0.24f);
+        break;
+    case ICON_TWINKLE: {
+        float p[20];
+        for (i = 0; i < 10; i++) {
+            float a = (-90.0f + i * 36.0f) * (float)M_PI / 180, r = (i & 1) ? 0.38f : 0.92f;
+            p[2 * i] = IX(r * cosf(a));
+            p[2 * i + 1] = IY(0.08f + r * sinf(a));
+        }
+        fill_poly(p, 10, ifg);
+        break;
+    }
+    case ICON_ROCKABYE:
+        C(-0.05f, 0.05f, 0.75f);
+        CB(0.33f, -0.22f, 0.6f);
+        C(0.62f, 0.52f, 0.09f);
+        C(0.8f, 0.12f, 0.06f);
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Picker UI                                                                */
 /* ------------------------------------------------------------------------ */
 
 #define HUE_R_IN     134.0f
 #define HUE_R_OUT    157.0f
-#define GAUGE_R_IN   110.0f
-#define GAUGE_R_OUT  124.0f
 #define SWATCH_R     100.0f
 #define MARKER_R     ((HUE_R_IN + HUE_R_OUT) / 2)
+#define SOUND_RING_R 134.0f
 
-enum mode { MODE_HUE, MODE_SAT, MODE_VAL, MODE_COUNT };
-static const char *mode_names[] = { "HUE", "SATURATION", "BRIGHTNESS" };
+enum mode { MODE_HUE, MODE_SOUND };
 
 static struct {
-    int h, s, v;            /* 0..359, 0..100, 0..100 */
+    int h;                  /* 0..359; saturation and brightness are fixed at 100% */
+    float hf;               /* fractional accumulator behind h */
+    int sound;              /* index into sounds[] */
+    int sound_acc;          /* ring counts towards the next sound step */
     enum mode mode;
     int64_t flash_until;    /* "SENT" confirmation */
     int mqtt_ok;
-    float hf, sf, vf;       /* fractional accumulators behind h/s/v */
 } ui;
 
 static void build_tables(void)
@@ -494,10 +726,9 @@ static void build_tables(void)
     }
 }
 
-static uint32_t hue_at(int tenths, void *ctx)
+static uint32_t hue_at(int tenths)
 {
     int r, g, b;
-    (void)ctx;
     hsv_to_rgb(tenths / 10.0f, 1.0f, 1.0f, &r, &g, &b);
     return rgb(r, g, b);
 }
@@ -508,80 +739,81 @@ static void build_background(void)
     int i;
     frame = background;
     for (i = 0; i < W * H; i++) frame[i] = rgb(0, 0, 0);
-    fill_arc(HUE_R_IN, HUE_R_OUT, 3600, hue_at, NULL);
+    fill_arc(HUE_R_IN, HUE_R_OUT, hue_at);
     frame = save;
 }
 
-static uint32_t gauge_color(int tenths, void *ctx)
+static void current_rgb(int *r, int *g, int *b)
 {
-    /* Gradient along the arc showing what the channel does to the color. */
-    int r, g, b;
-    float t = tenths / 3600.0f;
-    (void)ctx;
-    if (ui.mode == MODE_SAT) hsv_to_rgb(ui.h, t, ui.v / 100.0f, &r, &g, &b);
-    else                     hsv_to_rgb(ui.h, ui.s / 100.0f, t, &r, &g, &b);
-    return rgb(r, g, b);
-}
-
-static uint32_t const_color(int tenths, void *ctx)
-{
-    (void)tenths;
-    return *(uint32_t *)ctx;
+    hsv_to_rgb((float)ui.h, 1.0f, 1.0f, r, g, b);
 }
 
 static void render(void)
 {
-    int r, g, b, lum;
-    uint32_t col, fg, dim;
-    char hex[16], val[32];
-    float a, mx, my;
+    int r, g, b, lum, i;
+    uint32_t col, fg, black = rgb(0, 0, 0);
+    char hex[16];
+    float a;
 
-    memcpy(frame, background, W * H * 4);
-
-    hsv_to_rgb(ui.h, ui.s / 100.0f, ui.v / 100.0f, &r, &g, &b);
+    current_rgb(&r, &g, &b);
     col = rgb(r, g, b);
     lum = (r * 299 + g * 587 + b * 114) / 1000;
     fg = lum > 140 ? rgb(0, 0, 0) : rgb(255, 255, 255);
-    dim = rgb(60, 60, 60);
 
-    /* Gauge for saturation / brightness */
-    if (ui.mode != MODE_HUE) {
-        int pct = ui.mode == MODE_SAT ? ui.s : ui.v;
-        fill_arc(GAUGE_R_IN, GAUGE_R_OUT, 3600, const_color, &dim);
-        fill_arc(GAUGE_R_IN, GAUGE_R_OUT, pct * 36, gauge_color, NULL);
-        if (pct > 0) {
-            a = pct * 3.6f * (float)M_PI / 180.0f;
-            fill_circle(CX + sinf(a) * (GAUGE_R_IN + GAUGE_R_OUT) / 2,
-                        CY - cosf(a) * (GAUGE_R_IN + GAUGE_R_OUT) / 2, 9, rgb(255, 255, 255));
+    if (ui.mode == MODE_HUE) {
+        float mx, my;
+        memcpy(frame, background, W * H * 4);
+
+        /* Hue marker on the outer ring */
+        a = ui.h * (float)M_PI / 180.0f;
+        mx = CX + sinf(a) * MARKER_R;
+        my = CY - cosf(a) * MARKER_R;
+        fill_circle(mx, my, 16, black);
+        fill_circle(mx, my, 14, rgb(255, 255, 255));
+        fill_circle(mx, my, 10, col);
+
+        fill_circle(CX, CY, SWATCH_R + 2, rgb(40, 40, 40));
+        fill_circle(CX, CY, SWATCH_R, col);
+
+        snprintf(hex, sizeof(hex), "#%02X%02X%02X", r, g, b);
+        draw_text_centered(100, "COLOR", 2, fg);
+        draw_text_centered(140, hex, 4, fg);
+        if (now_ms() < ui.flash_until) {
+            draw_text_centered(188, "SENT", 3, fg);
+        } else {
+            draw_icon(sounds[ui.sound].icon, CX, 200, 13, fg, col);
+            draw_text_centered(222, sounds[ui.sound].label, 1, fg);
         }
+        fill_circle(CX, CY + (SWATCH_R + HUE_R_IN) / 2 + 2, 5,
+                    ui.mqtt_ok ? rgb(40, 210, 80) : rgb(230, 50, 40));
+    } else {
+        for (i = 0; i < W * H; i++) frame[i] = black;
+
+        /* Sound choices around the edge, starting at the top, clockwise */
+        for (i = 0; i < NSOUNDS; i++) {
+            float ang = i * 2.0f * (float)M_PI / NSOUNDS;
+            float x = CX + sinf(ang) * SOUND_RING_R, y = CY - cosf(ang) * SOUND_RING_R;
+            if (i == ui.sound) {
+                fill_circle(x, y, 23, col);
+                fill_circle(x, y, 20, rgb(255, 255, 255));
+                draw_icon(sounds[i].icon, x, y, 12, rgb(20, 20, 20), rgb(255, 255, 255));
+            } else {
+                fill_circle(x, y, 19, rgb(48, 48, 48));
+                draw_icon(sounds[i].icon, x, y, 11, rgb(190, 190, 190), rgb(48, 48, 48));
+            }
+        }
+
+        fill_circle(CX, CY, SWATCH_R + 2, rgb(40, 40, 40));
+        fill_circle(CX, CY, SWATCH_R, col);
+        draw_text_centered(76, "SOUND", 2, fg);
+        if (now_ms() < ui.flash_until) {
+            draw_text_centered(146, "SENT", 3, fg);
+        } else {
+            draw_icon(sounds[ui.sound].icon, CX, CY - 4, 36, fg, col);
+            draw_text_centered(208, sounds[ui.sound].label, 2, fg);
+        }
+        fill_circle(CX, CY + SWATCH_R - 12, 4, ui.mqtt_ok ? rgb(40, 210, 80) : rgb(230, 50, 40));
     }
-
-    /* Hue marker on the outer ring */
-    a = ui.h * (float)M_PI / 180.0f;
-    mx = CX + sinf(a) * MARKER_R;
-    my = CY - cosf(a) * MARKER_R;
-    fill_circle(mx, my, ui.mode == MODE_HUE ? 16 : 13, rgb(0, 0, 0));
-    fill_circle(mx, my, ui.mode == MODE_HUE ? 14 : 11, rgb(255, 255, 255));
-    fill_circle(mx, my, ui.mode == MODE_HUE ? 10 : 8, hue_at(ui.h * 10, NULL));
-
-    /* Swatch */
-    fill_circle(CX, CY, SWATCH_R + 2, rgb(40, 40, 40));
-    fill_circle(CX, CY, SWATCH_R, col);
-
-    snprintf(hex, sizeof(hex), "#%02X%02X%02X", r, g, b);
-    if (ui.mode == MODE_HUE) snprintf(val, sizeof(val), "%d", ui.h);
-    else snprintf(val, sizeof(val), "%d%%", ui.mode == MODE_SAT ? ui.s : ui.v);
-
-    draw_text_centered(108, mode_names[ui.mode], 2, fg);
-    draw_text_centered(146, hex, 4, fg);
-    if (now_ms() < ui.flash_until)
-        draw_text_centered(190, "SENT", 3, fg);
-    else
-        draw_text_centered(190, val, 3, fg);
-
-    /* MQTT status dot at the bottom, between the swatch and the hue ring */
-    fill_circle(CX, CY + (SWATCH_R + HUE_R_IN) / 2 + 2, 5,
-                ui.mqtt_ok ? rgb(40, 210, 80) : rgb(230, 50, 40));
 
     fb_present();
 }
@@ -593,19 +825,20 @@ static void render(void)
 static void state_load(void)
 {
     FILE *f;
-    ui.h = cfg.start_h; ui.s = cfg.start_s; ui.v = cfg.start_v;
+    int h = cfg.start_h, sound_id = cfg.start_sound;
     f = fopen(cfg.state_file, "r");
     if (f) {
-        int h, s, v;
-        if (fscanf(f, "%d %d %d", &h, &s, &v) == 3) { ui.h = h; ui.s = s; ui.v = v; }
+        int a, b, c;
+        /* v1 files were "h s v"; v2 is "h sound_id 2" */
+        if (fscanf(f, "%d %d %d", &a, &b, &c) == 3) {
+            h = a;
+            if (c == 2) sound_id = b;
+        }
         fclose(f);
     }
-    ui.h = ((ui.h % 360) + 360) % 360;
-    if (ui.s < 0) ui.s = 0;
-    if (ui.s > 100) ui.s = 100;
-    if (ui.v < 0) ui.v = 0;
-    if (ui.v > 100) ui.v = 100;
-    ui.hf = ui.h; ui.sf = ui.s; ui.vf = ui.v;
+    ui.h = ((h % 360) + 360) % 360;
+    ui.hf = (float)ui.h;
+    ui.sound = sound_index_for_id(sound_id);
 }
 
 static void state_save(void)
@@ -615,7 +848,7 @@ static void state_save(void)
     snprintf(tmp, sizeof(tmp), "%s.tmp", cfg.state_file);
     f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "%d %d %d\n", ui.h, ui.s, ui.v);
+    fprintf(f, "%d %d 2\n", ui.h, sounds[ui.sound].id);
     fclose(f);
     rename(tmp, cfg.state_file);
 }
@@ -624,10 +857,15 @@ static void state_save(void)
 /* MQTT (3.1.1, QoS 0) client thread                                        */
 /* ------------------------------------------------------------------------ */
 
+enum { CH_COLOR, CH_SOUND, NCH };
+
 static pthread_mutex_t mq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t mq_cond;
-static char mq_payload[256];
-static unsigned mq_seq;              /* bumped by the UI on every change */
+static struct {
+    char topic[160];
+    char payload[256];
+    unsigned seq;                    /* bumped by the UI on every change */
+} mq_ch[NCH];
 static volatile int mq_connected;
 static char status_topic[160];
 
@@ -736,7 +974,7 @@ static int read_timeout(int fd, uint8_t *buf, size_t len, int timeout_ms)
 
 static int mq_connect(void)
 {
-    uint8_t body[600], *p = body, ack[4];
+    uint8_t body[600], *p = body, ack[4] = { 0, 0, 0, 0 };
     uint8_t flags = 0x02; /* clean session */
     int fd;
     const char *cid = cfg.mqtt_client_id;
@@ -779,9 +1017,9 @@ static int mq_connect(void)
 
 static void *mqtt_thread(void *arg)
 {
-    int fd = -1, backoff = 1000;
-    unsigned sent_seq = 0;
-    int64_t last_tx = 0, last_rx = 0, last_pub = 0;
+    int fd = -1, backoff = 1000, c;
+    unsigned sent_seq[NCH];
+    int64_t last_tx = 0, last_rx = 0, last_pub[NCH] = { 0, 0 };
     (void)arg;
 
     while (running) {
@@ -801,25 +1039,31 @@ static void *mqtt_thread(void *arg)
             backoff = 1000;
             mq_connected = 1;
             last_tx = last_rx = now_ms();
-            sent_seq = mq_seq - 1; /* (re)publish current color on connect */
+            for (c = 0; c < NCH; c++) sent_seq[c] = mq_ch[c].seq - 1; /* (re)publish on connect */
         }
 
         {
-            char payload[256];
-            unsigned seq;
             int64_t t = now_ms();
             struct pollfd pfd;
-            int wait_ms;
+            int wait_ms = 50;
 
-            pthread_mutex_lock(&mq_lock);
-            seq = mq_seq;
-            copy_str(payload, sizeof(payload), mq_payload);
-            pthread_mutex_unlock(&mq_lock);
-
-            if (seq != sent_seq && payload[0] && t - last_pub >= cfg.publish_min_ms) {
-                if (mq_publish(fd, cfg.mqtt_topic, payload, cfg.mqtt_retain) < 0) goto drop;
-                sent_seq = seq;
-                last_pub = last_tx = t;
+            for (c = 0; c < NCH; c++) {
+                char topic[160], payload[256];
+                unsigned seq;
+                pthread_mutex_lock(&mq_lock);
+                seq = mq_ch[c].seq;
+                copy_str(topic, sizeof(topic), mq_ch[c].topic);
+                copy_str(payload, sizeof(payload), mq_ch[c].payload);
+                pthread_mutex_unlock(&mq_lock);
+                if (seq == sent_seq[c] || !payload[0]) continue;
+                if (t - last_pub[c] >= cfg.publish_min_ms) {
+                    if (mq_publish(fd, topic, payload, cfg.mqtt_retain) < 0) goto drop;
+                    sent_seq[c] = seq;
+                    last_pub[c] = last_tx = t;
+                } else {
+                    int w = (int)(cfg.publish_min_ms - (t - last_pub[c]));
+                    if (w < wait_ms) wait_ms = w;
+                }
             }
             if (t - last_tx >= 30000) {
                 if (mq_send_packet(fd, 0xC0, NULL, 0) < 0) goto drop; /* PINGREQ */
@@ -830,8 +1074,6 @@ static void *mqtt_thread(void *arg)
                 goto drop;
             }
 
-            /* Sleep until socket data, a UI change (poll timeout keeps it short), or ping time. */
-            wait_ms = seq != sent_seq ? (int)(cfg.publish_min_ms - (t - last_pub)) : 50;
             if (wait_ms < 1) wait_ms = 1;
             pfd.fd = fd; pfd.events = POLLIN;
             if (poll(&pfd, 1, wait_ms) == 1) {
@@ -857,17 +1099,32 @@ drop:
     return NULL;
 }
 
+static void mq_set(int ch, const char *payload)
+{
+    pthread_mutex_lock(&mq_lock);
+    copy_str(mq_ch[ch].payload, sizeof(mq_ch[ch].payload), payload);
+    mq_ch[ch].seq++;
+    pthread_cond_signal(&mq_cond);
+    pthread_mutex_unlock(&mq_lock);
+}
+
 static void publish_color(void)
 {
     int r, g, b;
-    hsv_to_rgb(ui.h, ui.s / 100.0f, ui.v / 100.0f, &r, &g, &b);
-    pthread_mutex_lock(&mq_lock);
-    snprintf(mq_payload, sizeof(mq_payload),
-             "{\"hex\":\"#%02x%02x%02x\",\"r\":%d,\"g\":%d,\"b\":%d,\"h\":%d,\"s\":%d,\"v\":%d}",
-             r, g, b, r, g, b, ui.h, ui.s, ui.v);
-    mq_seq++;
-    pthread_cond_signal(&mq_cond);
-    pthread_mutex_unlock(&mq_lock);
+    char buf[256];
+    current_rgb(&r, &g, &b);
+    snprintf(buf, sizeof(buf),
+             "{\"hex\":\"#%02x%02x%02x\",\"r\":%d,\"g\":%d,\"b\":%d,\"h\":%d,\"s\":100,\"v\":100}",
+             r, g, b, r, g, b, ui.h);
+    mq_set(CH_COLOR, buf);
+}
+
+static void publish_sound(void)
+{
+    char buf[256];
+    const struct sound *s = &sounds[ui.sound];
+    snprintf(buf, sizeof(buf), "{\"id\":%d,\"name\":\"%s\"}", s->id, s->name);
+    mq_set(CH_SOUND, buf);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -932,6 +1189,55 @@ static void cleanup(void)
     if (cfg.takeover) signal_nest(SIGCONT);
 }
 
+static int alloc_buffers(void)
+{
+    frame = malloc(W * H * 4);
+    background = malloc(W * H * 4);
+    angle_tbl = malloc(W * H * sizeof(uint16_t));
+    radius_tbl = malloc(W * H * sizeof(float));
+    return frame && background && angle_tbl && radius_tbl ? 0 : -1;
+}
+
+static void write_ppm(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    int i;
+    if (!f) { perror(path); return; }
+    fprintf(f, "P6\n%d %d\n255\n", W, H);
+    for (i = 0; i < W * H; i++) {
+        int r, g, b;
+        unpack(frame[i], &r, &g, &b);
+        fputc(r, f); fputc(g, f); fputc(b, f);
+    }
+    fclose(f);
+}
+
+/* Render every page and sound to PPM files in dir (no hardware access). */
+static int render_test(const char *dir)
+{
+    char path[512];
+    int i;
+    if (alloc_buffers() < 0) return 1;
+    build_tables();
+    build_background();
+    ui.mqtt_ok = 1;
+    ui.h = 210;
+    ui.sound = 2;
+    ui.mode = MODE_HUE;
+    render();
+    snprintf(path, sizeof(path), "%s/hue.ppm", dir);
+    write_ppm(path);
+    ui.mode = MODE_SOUND;
+    for (i = 0; i < NSOUNDS; i++) {
+        ui.sound = i;
+        ui.h = (i * 33 + 20) % 360;
+        render();
+        snprintf(path, sizeof(path), "%s/sound-%02d-%s.ppm", dir, i, sounds[i].name);
+        write_ppm(path);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *conf = CONF_PATH_DEFAULT;
@@ -955,16 +1261,14 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--evtest") == 0) return evtest();
         if (strcmp(argv[i], "--version") == 0) { printf("nest-picker %s\n", VERSION); return 0; }
+        if (strcmp(argv[i], "--render-test") == 0 && i + 1 < argc) return render_test(argv[i + 1]);
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) conf = argv[++i];
         else if (strcmp(argv[i], "--release") == 0) { signal_nest(SIGCONT); return 0; }
     }
     cfg_load(conf);
     snprintf(status_topic, sizeof(status_topic), "%s/status", cfg.mqtt_topic);
-    {
-        char *t = cfg.mqtt_topic; /* color goes to <topic>/color */
-        size_t n = strlen(t);
-        if (n + 6 < sizeof(cfg.mqtt_topic)) strcat(t, "/color");
-    }
+    snprintf(mq_ch[CH_COLOR].topic, sizeof(mq_ch[CH_COLOR].topic), "%s/color", cfg.mqtt_topic);
+    snprintf(mq_ch[CH_SOUND].topic, sizeof(mq_ch[CH_SOUND].topic), "%s/sound", cfg.mqtt_topic);
 
     lock_fd = open("/tmp/nest-picker.lock", O_CREAT | O_RDWR, 0644);
     if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
@@ -972,12 +1276,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    frame = malloc(W * H * 4);
-    background = malloc(W * H * 4);
-    angle_tbl = malloc(W * H * sizeof(uint16_t));
-    radius_tbl = malloc(W * H * sizeof(float));
-    if (!frame || !background || !angle_tbl || !radius_tbl) { syslog(LOG_ERR, "out of memory"); return 1; }
-
+    if (alloc_buffers() < 0) { syslog(LOG_ERR, "out of memory"); return 1; }
     if (fb_open() < 0) return 1;
     ring_fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
     btn_fd = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
@@ -999,10 +1298,12 @@ int main(int argc, char **argv)
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&mq_cond, &ca);
     publish_color();
+    publish_sound();
     pthread_create(&mq_tid, NULL, mqtt_thread, NULL);
 
-    syslog(LOG_INFO, "nest-picker %s running; broker %s:%d topic %s",
-           VERSION, cfg.mqtt_host[0] ? cfg.mqtt_host : "(none)", cfg.mqtt_port, cfg.mqtt_topic);
+    syslog(LOG_INFO, "nest-picker %s running; broker %s:%d topics %s, %s",
+           VERSION, cfg.mqtt_host[0] ? cfg.mqtt_host : "(none)", cfg.mqtt_port,
+           mq_ch[CH_COLOR].topic, mq_ch[CH_SOUND].topic);
 
     last_input = now_ms();
 
@@ -1035,27 +1336,22 @@ int main(int argc, char **argv)
                 awake = 1; dirty = 1; display_power(1);
             } else {
                 int d = cfg.ring_invert ? -ring_delta : ring_delta;
-                switch (ui.mode) {
-                case MODE_HUE:
+                if (ui.mode == MODE_HUE) {
                     ui.hf = fmodf(ui.hf + d * cfg.hue_step, 360.0f);
                     if (ui.hf < 0) ui.hf += 360.0f;
                     ui.h = (int)ui.hf % 360;
-                    break;
-                case MODE_SAT:
-                    ui.sf += d * cfg.pct_step;
-                    if (ui.sf < 0) ui.sf = 0;
-                    if (ui.sf > 100) ui.sf = 100;
-                    ui.s = (int)lrintf(ui.sf);
-                    break;
-                case MODE_VAL:
-                    ui.vf += d * cfg.pct_step;
-                    if (ui.vf < 0) ui.vf = 0;
-                    if (ui.vf > 100) ui.vf = 100;
-                    ui.v = (int)lrintf(ui.vf);
-                    break;
-                default: break;
+                    publish_color();
+                } else {
+                    int steps = 0;
+                    ui.sound_acc += d;
+                    while (ui.sound_acc >= cfg.sound_step) { ui.sound_acc -= cfg.sound_step; steps++; }
+                    while (ui.sound_acc <= -cfg.sound_step) { ui.sound_acc += cfg.sound_step; steps--; }
+                    if (steps) {
+                        ui.sound = ((ui.sound + steps) % NSOUNDS + NSOUNDS) % NSOUNDS;
+                        publish_sound();
+                        beep(2400, 4);
+                    }
                 }
-                publish_color();
                 dirty = 1;
                 state_dirty = 1;
                 last_state_change = t;
@@ -1063,7 +1359,7 @@ int main(int argc, char **argv)
             last_input = t;
         }
 
-        /* Button: short press cycles mode, long press re-sends */
+        /* Button: short press toggles hue/sound page, long press re-sends */
         for (;;) {
             struct ev e;
             ssize_t n = read(btn_fd, &e, sizeof(e));
@@ -1081,10 +1377,12 @@ int main(int argc, char **argv)
                 if (swallow_release) { swallow_release = 0; continue; }
                 if (press_start && t - press_start >= LONG_PRESS_MS) {
                     publish_color();
+                    publish_sound();
                     ui.flash_until = t + 1200;
                     beep(1500, 30); usleep(60000); beep(2000, 30);
                 } else if (press_start) {
-                    ui.mode = (enum mode)((ui.mode + 1) % MODE_COUNT);
+                    ui.mode = ui.mode == MODE_HUE ? MODE_SOUND : MODE_HUE;
+                    ui.sound_acc = 0;
                     beep(1000, 20);
                 }
                 press_start = 0;
@@ -1109,7 +1407,7 @@ int main(int argc, char **argv)
             last_freeze = t;
         }
 
-        /* Persist the color 5 s after the last change */
+        /* Persist the selection 5 s after the last change */
         if (state_dirty && t - last_state_change > 5000) {
             state_save();
             state_dirty = 0;
