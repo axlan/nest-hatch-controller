@@ -1,0 +1,37 @@
+#!/bin/sh
+# Boot-time supervisor for nest-picker (launched in the background from rcS).
+# Waits for the stock software to come up and Wi-Fi to connect, then runs the
+# picker, restarting it if it ever exits.
+
+CONF=/etc/nest-picker.conf
+BOOT_WAIT=5
+NET_WAIT=60
+[ -f "$CONF" ] && . "$CONF"
+# --now: skip the boot waits (used by install.sh)
+[ "$1" = "--now" ] && { BOOT_WAIT=0; NET_WAIT=0; }
+
+log() { logger -t nest-picker-start "$*"; }
+
+# Let nlclient start (monit launches it shortly after rcS finishes).
+n=0
+while ! pidof nlclient >/dev/null 2>&1 && [ "$n" -lt 60 ]; do
+    sleep 1; n=$((n + 1))
+done
+
+# Give connman a chance to join Wi-Fi before nlclient is frozen.
+n=0
+while ! ip route 2>/dev/null | grep -q '^default' && [ "$n" -lt "$NET_WAIT" ]; do
+    sleep 1; n=$((n + 1))
+done
+sleep "$BOOT_WAIT"
+
+while true; do
+    if [ -f /etc/nest-picker.disabled ]; then
+        sleep 10
+        continue
+    fi
+    log "starting nest-picker"
+    /usr/bin/nest-picker -c "$CONF"
+    log "nest-picker exited ($?), restarting in 5s"
+    sleep 5
+done

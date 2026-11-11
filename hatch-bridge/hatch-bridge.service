@@ -1,0 +1,18 @@
+# systemd user service:
+#   cp hatch-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hatch-bridge
+#   loginctl enable-linger $USER   # keep it running when you're logged out
+[Unit]
+Description=Nest picker MQTT -> Hatch Rest BLE bridge
+After=network-online.target bluetooth.target
+
+[Service]
+WorkingDirectory=%h/src/nest-ui/hatch-bridge
+Environment=MQTT_HOST=192.168.1.110
+Environment=HATCH_ADDRESS=E3:3F:DB:C8:93:E2
+ExecStart=%h/.local/bin/uv run hatch-bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
