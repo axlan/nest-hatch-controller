@@ -11,7 +11,7 @@ controls a **Hatch Rest (gen 1)** night light, over MQTT and Bluetooth LE.
 
 | Directory | What it is |
 |---|---|
-| [`src/`](src/), [`device/`](device/), [`build/`](build/), `build.sh`, `install.sh` | **nest-picker**: the Nest app (C, cross-compiled for the Nest's ARM/glibc 2.19) and its install scripts |
+| [`src/`](src/), [`device/`](device/), [`build/`](build/), [`tools/`](tools/), `build.sh`, `install.sh` | **nest-picker**: the Nest app (C, cross-compiled for the Nest's ARM/glibc 2.19), its install scripts and the night-mode GIF converter |
 | [`hatch-ble-bridge/`](hatch-ble-bridge/) | **ESP32-S3 firmware** (PlatformIO): MQTT → Hatch bridge with WiFiManager/UDP provisioning and OTA |
 | [`hatch-bridge/`](hatch-bridge/) | **Python tools** (uv): the same bridge in Python for testing, plus `hatch-ble-bridge-setup` to find and configure the ESP32 |
 
@@ -68,6 +68,7 @@ made while the Hatch is off are stored for when it's next switched on.
 - Green or red dot at the bottom: MQTT connected or disconnected.
 - Screen turns off after `SLEEP_SECS` of no input. Any touch wakes it, and that first touch doesn't change anything.
 - The last color and sound are restored after a reboot.
+- **Night mode** (optional): shows an animation instead of the picker during set hours (see below).
 
 Publishes are live while the ring turns, at most one per topic every `PUBLISH_MIN_MS`. The
 topic prefix (`nest/picker`), broker, ring sensitivity (`HUE_STEP`, `SOUND_STEP`) and the rest
@@ -75,6 +76,33 @@ are set in [`device/nest-picker.conf`](device/nest-picker.conf).
 
 Preview the screens on a PC without the device:
 `gcc -std=gnu99 -O2 -o /tmp/np src/nest-picker.c -lm -lpthread && /tmp/np --render-test /tmp` writes PPM images.
+
+### Night mode
+
+During configured hours, waking the screen shows an animation instead of the picker. At night the
+ring and press only keep the screen awake: the color and sound can't be changed. A screen that's
+already awake when night starts keeps the picker until it next sleeps.
+
+```
+TIMEZONE=America/Los_Angeles   # IANA name; empty = the Nest's own setting
+NIGHT_MODE=20:00-07:00         # empty = off; may wrap past midnight
+NIGHT_BACKLIGHT=30             # optional; empty = BACKLIGHT
+NIGHT_SLEEP_SECS=60            # optional; empty = SLEEP_SECS
+```
+
+```bash
+./install.sh 192.168.1.112 --config --night-gif moon.gif
+uv run tools/gif2anim.py moon.gif /tmp/moon.anim --preview /tmp/moon.png   # check it on the PC first
+```
+
+`tools/gif2anim.py` runs on the PC and refuses anything it can't use, before the Nest is touched.
+It crops each frame to fill the 320x320 screen and writes an uncompressed palette file. The picker
+memory-maps that file, so the frames sit in reclaimable cache rather than the picker's memory.
+
+**GIF tips:** square and at least 320x320, with the subject inside the central circle (the round
+lens hides the corners). Use a dark background, since it's shown at night. A seamless loop of at
+most **80 frames** works best; each frame is about 100 KB on the Nest. Frame timings are kept
+(minimum 20 ms; 0 ms becomes 100 ms). A still GIF or PNG works too.
 
 ### How it works
 

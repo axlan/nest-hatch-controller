@@ -43,7 +43,7 @@
 
 #include "font5x7.h"
 
-#define VERSION "2.0"
+#define VERSION "2.1"
 
 /* ------------------------------------------------------------------------ */
 /* Sounds (Hatch Rest gen 1 ids; bird chirps (9) intentionally left out)    */
@@ -107,6 +107,12 @@ static struct {
     int  start_h;
     int  start_sound;      /* Hatch sound id */
     char state_file[128];
+    char timezone[64];     /* IANA zone, e.g. America/Chicago; empty = system /etc/localtime */
+    char night_mode[16];   /* "HH:MM-HH:MM", may wrap past midnight; empty = off */
+    char night_anim[128];  /* animation file shown at night (made by tools/gif2anim.py) */
+    int  night_backlight;  /* -1 = BACKLIGHT */
+    int  night_sleep_secs; /* -1 = SLEEP_SECS */
+    int  night_start, night_end; /* minutes after midnight, parsed from night_mode; -1 = off */
 } cfg;
 
 static void cfg_defaults(void)
@@ -125,6 +131,10 @@ static void cfg_defaults(void)
     cfg.takeover = 1;
     cfg.start_h = 30;
     cfg.start_sound = 0;
+    strcpy(cfg.night_anim, "/media/data/nest-picker/night.anim");
+    cfg.night_backlight = -1;
+    cfg.night_sleep_secs = -1;
+    cfg.night_start = cfg.night_end = -1;
     strcpy(cfg.state_file, "/media/user-config/nest-picker.state");
 }
 
@@ -162,6 +172,7 @@ static void cfg_load(const char *path)
 #define S(k, field) else if (strcmp(key, k) == 0) copy_str(cfg.field, sizeof(cfg.field), val)
 #define I(k, field) else if (strcmp(key, k) == 0) cfg.field = atoi(val)
 #define F(k, field) else if (strcmp(key, k) == 0) cfg.field = (float)atof(val)
+#define IO(k, field) else if (strcmp(key, k) == 0) cfg.field = *val ? atoi(val) : -1
         if (0) {}
         S("MQTT_HOST", mqtt_host);
         I("MQTT_PORT", mqtt_port);
@@ -181,15 +192,34 @@ static void cfg_load(const char *path)
         I("START_H", start_h);
         I("START_SOUND", start_sound);
         S("STATE_FILE", state_file);
+        S("TIMEZONE", timezone);
+        S("NIGHT_MODE", night_mode);
+        S("NIGHT_ANIM", night_anim);
+        IO("NIGHT_BACKLIGHT", night_backlight);
+        IO("NIGHT_SLEEP_SECS", night_sleep_secs);
 #undef S
 #undef I
 #undef F
+#undef IO
     }
     fclose(f);
     if (cfg.backlight < 1) cfg.backlight = 1;
     if (cfg.backlight > 100) cfg.backlight = 100;
     if (cfg.hue_step <= 0) cfg.hue_step = 1.0f;
     if (cfg.sound_step < 1) cfg.sound_step = 1;
+    if (cfg.night_backlight > 100) cfg.night_backlight = 100;
+    if (cfg.night_mode[0]) {
+        int h1, m1, h2, m2;
+        char extra;
+        if (sscanf(cfg.night_mode, "%d:%d-%d:%d%c", &h1, &m1, &h2, &m2, &extra) == 4 &&
+            h1 >= 0 && h1 < 24 && h2 >= 0 && h2 < 24 && m1 >= 0 && m1 < 60 && m2 >= 0 && m2 < 60 &&
+            (h1 != h2 || m1 != m2)) {
+            cfg.night_start = h1 * 60 + m1;
+            cfg.night_end = h2 * 60 + m2;
+        } else {
+            syslog(LOG_WARNING, "ignoring invalid NIGHT_MODE '%s' (expected HH:MM-HH:MM)", cfg.night_mode);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -377,12 +407,14 @@ static void fb_present(void)
     ioctl(fb_fd, OMAPFB_UPDATE_WINDOW, &uw);
 }
 
+static int disp_backlight = -1; /* level for the current mode; -1 = BACKLIGHT */
+
 static void display_power(int on)
 {
     char buf[16];
     if (on) {
         write_sysfs(BLANK_PATH, "0\n");
-        snprintf(buf, sizeof(buf), "%d\n", cfg.backlight);
+        snprintf(buf, sizeof(buf), "%d\n", disp_backlight >= 0 ? disp_backlight : cfg.backlight);
         write_sysfs(BACKLIGHT_PATH, buf);
     } else {
         write_sysfs(BACKLIGHT_PATH, "0\n");
@@ -697,7 +729,7 @@ static void draw_icon(enum icon icon, float cx, float cy, float half, uint32_t f
 #define MARKER_R     ((HUE_R_IN + HUE_R_OUT) / 2)
 #define SOUND_RING_R 134.0f
 
-enum mode { MODE_HUE, MODE_SOUND };
+enum mode { MODE_HUE, MODE_SOUND, MODE_NIGHT };
 
 static struct {
     int h;                  /* 0..359; saturation and brightness are fixed at 100% */
@@ -707,6 +739,8 @@ static struct {
     enum mode mode;
     int64_t flash_until;    /* "SENT" confirmation */
     int mqtt_ok;
+    int anim_idx;           /* night animation frame on screen */
+    int64_t anim_next;      /* when to advance to the next frame */
 } ui;
 
 static void build_tables(void)
@@ -748,12 +782,95 @@ static void current_rgb(int *r, int *g, int *b)
     hsv_to_rgb((float)ui.h, 1.0f, 1.0f, r, g, b);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Night mode: animation file made by tools/gif2anim.py                     */
+/*   header (16 B): "NANM" u16 version=1, u16 w=320, u16 h=320, u16 frames, */
+/*                  u32 reserved                                            */
+/*   frame: u16 delay_ms, u16 reserved, 256*3 RGB palette, 320*320 indices  */
+/* The file is mmap'ed read-only, so frames live in reclaimable page cache. */
+/* ------------------------------------------------------------------------ */
+
+#define ANIM_HDR   16
+#define ANIM_FRAME (4 + 256 * 3 + W * H)
+
+static const uint8_t *anim;
+static size_t anim_len;
+static int anim_frames;
+
+static unsigned rd16(const uint8_t *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+
+static int anim_load(const char *path)
+{
+    struct stat st;
+    void *m;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { syslog(LOG_WARNING, "night: cannot open %s: %m", path); return -1; }
+    if (fstat(fd, &st) < 0 || st.st_size < ANIM_HDR) {
+        syslog(LOG_WARNING, "night: %s is too small", path);
+        close(fd);
+        return -1;
+    }
+    m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) { syslog(LOG_WARNING, "night: mmap %s: %m", path); return -1; }
+    {
+        const uint8_t *h = m;
+        int frames = (int)rd16(h + 10);
+        if (memcmp(h, "NANM", 4) != 0 || rd16(h + 4) != 1 || rd16(h + 6) != W || rd16(h + 8) != H ||
+            frames < 1 || (size_t)st.st_size != ANIM_HDR + (size_t)frames * ANIM_FRAME) {
+            syslog(LOG_WARNING, "night: %s is not a valid 320x320 animation (re-run tools/gif2anim.py)", path);
+            munmap(m, (size_t)st.st_size);
+            return -1;
+        }
+        anim = h;
+        anim_len = (size_t)st.st_size;
+        anim_frames = frames;
+    }
+    return 0;
+}
+
+static const uint8_t *anim_frame(int i) { return anim + ANIM_HDR + (size_t)i * ANIM_FRAME; }
+
+static int anim_delay(int i)
+{
+    int d = (int)rd16(anim_frame(i));
+    return d < 20 ? 20 : d;
+}
+
+static void render_anim_frame(int i)
+{
+    const uint8_t *f = anim_frame(i), *pal = f + 4, *px = f + 4 + 256 * 3;
+    uint32_t lut[256];
+    int k;
+    for (k = 0; k < 256; k++) lut[k] = rgb(pal[3 * k], pal[3 * k + 1], pal[3 * k + 2]);
+    for (k = 0; k < W * H; k++) frame[k] = lut[px[k]];
+    fb_present();
+}
+
+/* True if the local time is inside NIGHT_MODE (ranges may wrap past midnight). */
+static int is_night(void)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    int m;
+    if (cfg.night_start < 0) return 0;
+    localtime_r(&now, &tm);
+    m = tm.tm_hour * 60 + tm.tm_min;
+    if (cfg.night_start < cfg.night_end) return m >= cfg.night_start && m < cfg.night_end;
+    return m >= cfg.night_start || m < cfg.night_end;
+}
+
 static void render(void)
 {
     int r, g, b, lum, i;
     uint32_t col, fg, black = rgb(0, 0, 0);
     char hex[16];
     float a;
+
+    if (ui.mode == MODE_NIGHT) {
+        render_anim_frame(ui.anim_idx);
+        return;
+    }
 
     current_rgb(&r, &g, &b);
     col = rgb(r, g, b);
@@ -1213,7 +1330,7 @@ static void write_ppm(const char *path)
 }
 
 /* Render every page and sound to PPM files in dir (no hardware access). */
-static int render_test(const char *dir)
+static int render_test(const char *dir, const char *anim_path)
 {
     char path[512];
     int i;
@@ -1235,7 +1352,57 @@ static int render_test(const char *dir)
         snprintf(path, sizeof(path), "%s/sound-%02d-%s.ppm", dir, i, sounds[i].name);
         write_ppm(path);
     }
+    if (anim_path) {
+        if (anim_load(anim_path) < 0) return 1;
+        ui.mode = MODE_NIGHT;
+        for (i = 0; i < anim_frames && i < 16; i++) {
+            ui.anim_idx = i;
+            render();
+            snprintf(path, sizeof(path), "%s/night-%02d.ppm", dir, i);
+            write_ppm(path);
+        }
+    }
     return 0;
+}
+
+/* On wake (and at startup): night animation during NIGHT_MODE hours, else the color page. */
+static void choose_wake_mode(int64_t t)
+{
+    if (anim_frames > 0 && is_night()) {
+        ui.mode = MODE_NIGHT;
+        ui.anim_idx = 0;
+        ui.anim_next = t + anim_delay(0);
+        disp_backlight = cfg.night_backlight;
+    } else {
+        if (ui.mode == MODE_NIGHT) ui.mode = MODE_HUE;
+        disp_backlight = -1;
+    }
+    display_power(1);
+}
+
+static void setup_time_and_night(void)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    char buf[64];
+
+    if (cfg.timezone[0]) {
+        char zpath[200];
+        snprintf(zpath, sizeof(zpath), "/usr/share/zoneinfo/%s", cfg.timezone);
+        if (access(zpath, R_OK) != 0)
+            syslog(LOG_WARNING, "TIMEZONE '%s' not found in /usr/share/zoneinfo; times will be UTC", cfg.timezone);
+        setenv("TZ", cfg.timezone, 1);
+    }
+    tzset();
+    localtime_r(&now, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M %Z", &tm);
+    syslog(LOG_INFO, "local time %s (TIMEZONE=%s)", buf, cfg.timezone[0] ? cfg.timezone : "system");
+
+    if (cfg.night_start < 0) return;
+    if (anim_load(cfg.night_anim) == 0)
+        syslog(LOG_INFO, "night mode %s with %d-frame animation %s", cfg.night_mode, anim_frames, cfg.night_anim);
+    else
+        syslog(LOG_WARNING, "night mode %s disabled: no usable animation", cfg.night_mode);
 }
 
 int main(int argc, char **argv)
@@ -1261,11 +1428,13 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--evtest") == 0) return evtest();
         if (strcmp(argv[i], "--version") == 0) { printf("nest-picker %s\n", VERSION); return 0; }
-        if (strcmp(argv[i], "--render-test") == 0 && i + 1 < argc) return render_test(argv[i + 1]);
+        if (strcmp(argv[i], "--render-test") == 0 && i + 1 < argc)
+            return render_test(argv[i + 1], i + 2 < argc ? argv[i + 2] : NULL);
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) conf = argv[++i];
         else if (strcmp(argv[i], "--release") == 0) { signal_nest(SIGCONT); return 0; }
     }
     cfg_load(conf);
+    setup_time_and_night();
     snprintf(status_topic, sizeof(status_topic), "%s/status", cfg.mqtt_topic);
     snprintf(mq_ch[CH_COLOR].topic, sizeof(mq_ch[CH_COLOR].topic), "%s/color", cfg.mqtt_topic);
     snprintf(mq_ch[CH_SOUND].topic, sizeof(mq_ch[CH_SOUND].topic), "%s/sound", cfg.mqtt_topic);
@@ -1292,7 +1461,7 @@ int main(int argc, char **argv)
         signal_nest(SIGSTOP);
         atexit(cleanup);
     }
-    display_power(1);
+    choose_wake_mode(now_ms());
 
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
@@ -1318,6 +1487,11 @@ int main(int argc, char **argv)
             int64_t wait = 33 - (now_ms() - last_render);
             timeout = wait > 0 ? (int)wait : 0;
         }
+        if (awake && ui.mode == MODE_NIGHT && anim_frames > 1) {
+            int64_t wait = ui.anim_next - now_ms();
+            if (wait < 0) wait = 0;
+            if (wait < timeout) timeout = (int)wait;
+        }
 
         pfd[0].fd = ring_fd; pfd[0].events = POLLIN;
         pfd[1].fd = btn_fd;  pfd[1].events = POLLIN;
@@ -1333,7 +1507,9 @@ int main(int argc, char **argv)
         }
         if (ring_delta) {
             if (!awake) {
-                awake = 1; dirty = 1; display_power(1);
+                awake = 1; dirty = 1; choose_wake_mode(t);
+            } else if (ui.mode == MODE_NIGHT) {
+                /* Night: input only keeps the screen awake. */
             } else {
                 int d = cfg.ring_invert ? -ring_delta : ring_delta;
                 if (ui.mode == MODE_HUE) {
@@ -1368,13 +1544,14 @@ int main(int argc, char **argv)
             last_input = t;
             if (e.value == 1) {
                 if (!awake) {
-                    awake = 1; dirty = 1; display_power(1);
+                    awake = 1; dirty = 1; choose_wake_mode(t);
                     swallow_release = 1;
                 } else {
                     press_start = t;
                 }
             } else if (e.value == 0) {
                 if (swallow_release) { swallow_release = 0; continue; }
+                if (ui.mode == MODE_NIGHT) { press_start = 0; continue; }
                 if (press_start && t - press_start >= LONG_PRESS_MS) {
                     publish_color();
                     publish_sound();
@@ -1392,6 +1569,12 @@ int main(int argc, char **argv)
 
         if (ui.mqtt_ok != mq_connected) { ui.mqtt_ok = mq_connected; dirty = 1; }
         if (ui.flash_until && t >= ui.flash_until) { ui.flash_until = 0; dirty = 1; }
+
+        if (awake && ui.mode == MODE_NIGHT && anim_frames > 1 && t >= ui.anim_next) {
+            ui.anim_idx = (ui.anim_idx + 1) % anim_frames;
+            ui.anim_next = t + anim_delay(ui.anim_idx);
+            dirty = 1;
+        }
 
         if (dirty && awake && t - last_render >= 33) {
             render();
@@ -1413,10 +1596,13 @@ int main(int argc, char **argv)
             state_dirty = 0;
         }
 
-        if (awake && cfg.sleep_secs > 0 && t - last_input > (int64_t)cfg.sleep_secs * 1000) {
-            awake = 0;
-            ui.mode = MODE_HUE;
-            display_power(0);
+        {
+            int secs = (ui.mode == MODE_NIGHT && cfg.night_sleep_secs >= 0) ? cfg.night_sleep_secs : cfg.sleep_secs;
+            if (awake && secs > 0 && t - last_input > (int64_t)secs * 1000) {
+                awake = 0;
+                ui.mode = MODE_HUE;
+                display_power(0);
+            }
         }
     }
 
