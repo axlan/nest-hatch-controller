@@ -8,8 +8,8 @@ cd "$(dirname "$0")"
 docker build -q -t nest-ui-xc build >/dev/null
 mkdir -p out
 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" nest-ui-xc \
-    arm-linux-gnueabihf-gcc -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter \
+    sh -c 'arm-linux-gnueabihf-gcc -std=gnu99 -D_GNU_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter \
         -march=armv7-a -mtune=cortex-a8 -mfpu=neon -mfloat-abi=hard \
-        -o out/nest-picker src/nest-picker.c -lm -lpthread
+        -o out/nest-picker src/*.c -lm -lpthread'
 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" nest-ui-xc arm-linux-gnueabihf-strip out/nest-picker
 ls -la out/nest-picker

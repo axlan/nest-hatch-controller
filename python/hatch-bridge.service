@@ -7,7 +7,7 @@ Description=Nest picker MQTT -> Hatch Rest BLE bridge
 After=network-online.target bluetooth.target
 
 [Service]
-WorkingDirectory=%h/src/nest-ui/hatch-bridge
+WorkingDirectory=%h/src/nest-ui/python
 Environment=MQTT_HOST=192.168.1.110
 Environment=HATCH_ADDRESS=E3:3F:DB:C8:93:E2
 ExecStart=%h/.local/bin/uv run hatch-bridge

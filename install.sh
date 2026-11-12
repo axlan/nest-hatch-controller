@@ -42,7 +42,7 @@ if [ "$MODE" = install ]; then
     [ "$PUSH_CONFIG" = 1 ] && cp device/nest-picker.conf "$STAGE/"
     if [ -n "$NIGHT_GIF" ]; then
         # Validate and convert locally first; nothing is sent to the Nest if this fails.
-        uv run tools/gif2anim.py "$NIGHT_GIF" "$STAGE/night.anim"
+        uv run --project python gif2anim "$NIGHT_GIF" "$STAGE/night.anim"
     fi
 fi
 

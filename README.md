@@ -11,9 +11,9 @@ controls a **Hatch Rest (gen 1)** night light, over MQTT and Bluetooth LE.
 
 | Directory | What it is |
 |---|---|
-| [`src/`](src/), [`device/`](device/), [`build/`](build/), [`tools/`](tools/), `build.sh`, `install.sh` | **nest-picker**: the Nest app (C, cross-compiled for the Nest's ARM/glibc 2.19), its install scripts and the night-mode GIF converter |
+| [`src/`](src/), [`device/`](device/), [`build/`](build/), `build.sh`, `install.sh` | **nest-picker**: the Nest app (C, cross-compiled for the Nest's ARM/glibc 2.19; module map at the top of [`src/main.c`](src/main.c)) and its install scripts |
 | [`hatch-ble-bridge/`](hatch-ble-bridge/) | **ESP32-S3 firmware** (PlatformIO): MQTT → Hatch bridge with WiFiManager/UDP provisioning and OTA |
-| [`hatch-bridge/`](hatch-bridge/) | **Python tools** (uv): the same bridge in Python for testing, plus `hatch-ble-bridge-setup` to find and configure the ESP32 |
+| [`python/`](python/) | **PC tools** (uv): `hatch-bridge` (the bridge in Python, for testing), `hatch-ble-bridge-setup` (find and configure the ESP32) and `gif2anim` (night-mode GIF converter) |
 
 ## Quick start
 
@@ -29,7 +29,7 @@ Requirements:
 
 # 2. Bridge: flash the ESP32-S3, then join its "hatch-ble-bridge-ap" WiFi to set up WiFi
 cd hatch-ble-bridge && pio run -t upload && cd ..
-cd hatch-bridge
+cd python
 uv run hatch-ble-bridge-setup find-devices
 uv run hatch-ble-bridge-setup setup-mqtt -h 192.168.1.110
 uv run hatch-ble-bridge-setup status
@@ -38,7 +38,7 @@ uv run hatch-ble-bridge-setup status
 For testing without the ESP32, run the Python bridge instead. Only one BLE client can be connected to the Hatch at a time.
 
 ```bash
-cd hatch-bridge && uv run hatch-bridge --broker 192.168.1.110 --hatch E3:3F:DB:C8:93:E2
+cd python && uv run hatch-bridge --broker 192.168.1.110 --hatch E3:3F:DB:C8:93:E2
 ```
 
 ## MQTT topics
@@ -75,7 +75,7 @@ topic prefix (`nest/picker`), broker, ring sensitivity (`HUE_STEP`, `SOUND_STEP`
 are set in [`device/nest-picker.conf`](device/nest-picker.conf).
 
 Preview the screens on a PC without the device:
-`gcc -std=gnu99 -O2 -o /tmp/np src/nest-picker.c -lm -lpthread && /tmp/np --render-test /tmp` writes PPM images.
+`gcc -std=gnu99 -D_GNU_SOURCE -O2 -o /tmp/np src/*.c -lm -lpthread && /tmp/np --render-test /tmp` writes PPM images.
 
 ### Night mode
 
@@ -92,10 +92,10 @@ NIGHT_SLEEP_SECS=60            # optional; empty = SLEEP_SECS
 
 ```bash
 ./install.sh 192.168.1.112 --config --night-gif moon.gif
-uv run tools/gif2anim.py moon.gif /tmp/moon.anim --preview /tmp/moon.png   # check it on the PC first
+uv run --project python gif2anim moon.gif /tmp/moon.anim --preview /tmp/moon.png   # check it on the PC first
 ```
 
-`tools/gif2anim.py` runs on the PC and refuses anything it can't use, before the Nest is touched.
+`gif2anim` (in [`python/`](python/)) runs on the PC and refuses anything it can't use, before the Nest is touched.
 It crops each frame to fill the 320x320 screen and writes an uncompressed palette file. The picker
 memory-maps that file, so the frames sit in reclaimable cache rather than the picker's memory.
 

@@ -1,0 +1,22 @@
+[project]
+name = "nest-ui"
+version = "0.2.0"
+description = "PC-side tools for nest-ui: MQTT -> Hatch Rest BLE bridge, ESP32 bridge setup, night-mode GIF converter"
+requires-python = ">=3.11"
+dependencies = [
+    "aiomqtt>=2.3",
+    "bleak>=0.22",
+    "paho-mqtt>=2.0",
+    "pillow>=10",
+    "typer>=0.12",
+    "zeroconf>=0.132",
+]
+
+[project.scripts]
+hatch-bridge = "nest_ui.hatch_bridge:main"
+hatch-ble-bridge-setup = "nest_ui.device_setup:app"
+gif2anim = "nest_ui.gif2anim:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,10 +1,6 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["pillow>=10"]
-# ///
 """Convert a GIF (or a still GIF/PNG) into the nest-picker night-mode animation.
 
-    uv run tools/gif2anim.py IN.gif OUT.anim [--preview PREVIEW.png]
+    uv run --project python gif2anim IN.gif OUT.anim [--preview PREVIEW.png]   (from the repo root)
 
 Every frame is cropped to fill the 320x320 screen (scaled to cover, centered),
 reduced to its own 256-color palette and stored uncompressed, so the Nest can

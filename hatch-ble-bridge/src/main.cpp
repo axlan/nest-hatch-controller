@@ -6,7 +6,7 @@
 //     (the MQTT broker can be entered there too).
 //   - MQTT broker and bridge settings: UDP commands on port 5432
 //     (_mqtt-config._udp via mDNS), see device_config.h. Use the
-//     `hatch-ble-bridge-setup` Python tool in ../hatch-bridge.
+//     `hatch-ble-bridge-setup` Python tool in ../python.
 //   - OTA: pio run -t upload --upload-port hatch-ble-bridge.local
 //
 // MQTT topics:

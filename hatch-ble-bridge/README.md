@@ -1,6 +1,6 @@
 # hatch-ble-bridge (ESP32-S3)
 
-Firmware that does what the Python `hatch-bridge` does, on an ESP32-S3. It
+Firmware that does what the Python `hatch-bridge` (in `../python`) does, on an ESP32-S3. It
 subscribes to the Nest picker's color and sound on MQTT and applies them to a
 **Hatch Rest (gen 1)** over BLE.
 
@@ -47,10 +47,10 @@ This follows [axlan/pcb-map](https://github.com/axlan/pcb-map)'s scheme:
    called **`hatch-ble-bridge-ap`**. Join it and the captive portal asks for WiFi credentials,
    and optionally the MQTT broker.
 2. **MQTT and bridge settings:** once on WiFi, the board advertises `_mqtt-config._udp` over mDNS
-   and listens for plain-text UDP commands on port 5432. The setup tool lives in `../hatch-bridge`:
+   and listens for plain-text UDP commands on port 5432. The setup tool lives in `../python`:
 
 ```bash
-cd ../hatch-bridge
+cd ../python
 uv run hatch-ble-bridge-setup find-devices                        # mDNS → MQTT ping → setup-AP scan
 uv run hatch-ble-bridge-setup status                              # WiFi / MQTT / Hatch status (JSON)
 uv run hatch-ble-bridge-setup setup-mqtt -h 192.168.1.110         # broker (-p, -t, -u, -P)
