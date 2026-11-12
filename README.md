@@ -3,6 +3,10 @@
 Turns a rooted **Nest Learning Thermostat (Gen 1)** into a color and sound picker that
 controls a **Hatch Rest (gen 1)** night light, over MQTT and Bluetooth LE.
 
+[![Video of the Nest picker controlling a Hatch Rest](https://img.youtube.com/vi/RDX0zPxVPMA/hqdefault.jpg)](https://youtu.be/RDX0zPxVPMA)
+
+▶ **[Watch it running on the real hardware](https://youtu.be/RDX0zPxVPMA)**
+
 ```
  Nest Gen 1 (nest-picker)  ──MQTT──▶  broker  ──MQTT──▶  bridge  ──BLE──▶  Hatch Rest
  ring = hue / sound                                      ESP32-S3 (hatch-ble-bridge)
